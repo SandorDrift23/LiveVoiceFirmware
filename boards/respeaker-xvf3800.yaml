@@ -1,0 +1,158 @@
+# ReSpeaker XVF3800 + XIAO ESP32-S3 target.
+# Same full-duplex client and protocol as Voice PE. The XVF inthost firmware,
+# AEC register setup, and AIC3104 codec driver are not in this image yet, so
+# aec_verified stays false and speaker output is not brought up.
+substitutions:
+  name: live-voice-respeaker
+  friendly_name: Live Voice ReSpeaker
+  va_url: "ws://192.168.1.10:8080/"
+  hidden_ssid: "false"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  name_add_mac_suffix: false
+  min_version: 2026.5.0
+  project:
+    name: livevoice.respeaker-xvf3800
+    version: "0.1.0"
+  on_boot:
+    priority: 200
+    then:
+      - delay: 8s
+      - micro_wake_word.start:
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  flash_size: 8MB
+  framework:
+    type: esp-idf
+    version: recommended
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+wifi:
+  ssid: ${wifi_ssid}
+  password: ${wifi_password}
+  fast_connect: ${hidden_ssid}
+  power_save_mode: none
+
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: ${api_key}
+
+ota:
+  - platform: esphome
+    password: ${ota_password}
+
+# XVF3800 is the I2S clock master. Two slave controllers share its clocks;
+# one duplex controller corrupted DMA on this hardware.
+i2s_audio:
+  - id: i2s_output
+    i2s_lrclk_pin:
+      number: GPIO7
+    i2s_bclk_pin:
+      number: GPIO8
+  - id: i2s_input
+    i2s_lrclk_pin:
+      number: GPIO7
+    i2s_bclk_pin:
+      number: GPIO8
+
+microphone:
+  - platform: i2s_audio
+    id: board_mics
+    i2s_din_pin: GPIO43
+    adc_type: external
+    pdm: false
+    sample_rate: 48000
+    bits_per_sample: 32bit
+    i2s_mode: secondary
+    i2s_audio_id: i2s_input
+    channel: stereo
+
+speaker:
+  - platform: i2s_audio
+    id: i2s_speaker
+    sample_rate: 48000
+    i2s_mode: secondary
+    i2s_dout_pin: GPIO44
+    bits_per_sample: 32bit
+    i2s_audio_id: i2s_output
+    dac_type: external
+    channel: stereo
+    timeout: never
+    buffer_duration: 500ms
+  - platform: mixer
+    id: mixing_speaker
+    output_speaker: i2s_speaker
+    num_channels: 1
+    task_stack_in_psram: true
+    source_speakers:
+      - id: voice_mix
+        timeout: never
+      - id: idle_mix
+        timeout: never
+  - platform: resampler
+    id: voice_speaker
+    output_speaker: voice_mix
+    sample_rate: 48000
+    bits_per_sample: 16
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [live_voice]
+
+live_voice:
+  id: voice
+  url: ${va_url}
+  device: respeaker_xvf3800
+  microphone: board_mics
+  mic_channel: 0
+  speaker: voice_speaker
+  input_rate: 48000
+  output_rate: 24000
+  aec_verified: false
+
+micro_wake_word:
+  id: wake
+  microphone:
+    microphone: board_mics
+    channels: 0
+  stop_after_detection: false
+  models:
+    - model: https://raw.githubusercontent.com/SandorDrift23/home-assistant-voice-pe/feature/gpt-live-voice-pe/wake-models/alexa.json
+      id: alexa
+    - model: https://raw.githubusercontent.com/SandorDrift23/home-assistant-voice-pe/feature/gpt-live-voice-pe/wake-models/stop.json
+      id: stop
+  vad:
+    model: https://raw.githubusercontent.com/SandorDrift23/home-assistant-voice-pe/feature/gpt-live-voice-pe/wake-models/vad.json
+  on_wake_word_detected:
+    - if:
+        condition:
+          lambda: 'return wake_word == "Stop" || wake_word == "stop";'
+        then:
+          - lambda: 'id(voice).send_interrupt();'
+        else:
+          - lambda: 'id(voice).start_session();'
+
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO0
+      inverted: true
+    on_click:
+      - lambda: |-
+          if (id(voice).is_streaming()) {
+            id(voice).send_interrupt();
+          } else {
+            id(voice).start_session();
+          }

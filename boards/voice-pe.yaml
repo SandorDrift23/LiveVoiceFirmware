@@ -1,0 +1,424 @@
+# Shared full-duplex firmware for Home Assistant Voice PE.
+# Secrets and the gateway address come from the device stub as substitutions.
+substitutions:
+  name: live-voice-pe
+  friendly_name: Live Voice PE
+  va_url: "ws://192.168.178.20:8080/"
+  hidden_ssid: "false"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  name_add_mac_suffix: false
+  min_version: 2026.5.0
+  project:
+    name: livevoice.voice-pe
+    version: "0.2.14"
+  on_boot:
+    priority: 375
+    then:
+      - switch.turn_on: internal_speaker_amp
+      - delay: 4s
+      - media_player.volume_set:
+          id: sound_player
+          volume: 1.0
+      - script.execute: apply_volume
+      - delay: 4s
+      - micro_wake_word.start:
+      - script.execute: apply_wake_word
+
+esp32:
+  board: esp32-s3-devkitc-1
+  cpu_frequency: 240MHz
+  variant: esp32s3
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+    version: recommended
+    sdkconfig_options:
+      CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
+      CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
+      CONFIG_SPIRAM_RODATA: "y"
+      CONFIG_SPIRAM_FETCH_INSTRUCTIONS: "y"
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  fast_connect: ${hidden_ssid}
+  power_save_mode: none
+  reboot_timeout: 5min
+
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+    encryption: 
+
+i2c:
+  - id: internal_i2c
+    sda: GPIO5
+    scl: GPIO6
+    frequency: 400kHz
+
+switch:
+  - platform: gpio
+    pin: GPIO47
+    id: internal_speaker_amp
+    restore_mode: ALWAYS_ON
+    internal: true
+
+i2s_audio:
+  - id: i2s_output
+    i2s_lrclk_pin:
+      number: GPIO7
+    i2s_bclk_pin:
+      number: GPIO8
+  - id: i2s_input
+    i2s_lrclk_pin:
+      number: GPIO14
+    i2s_bclk_pin:
+      number: GPIO13
+
+microphone:
+  - platform: i2s_audio
+    id: board_mics
+    i2s_din_pin: GPIO15
+    adc_type: external
+    pdm: false
+    sample_rate: 16000
+    bits_per_sample: 32bit
+    i2s_mode: secondary
+    i2s_audio_id: i2s_input
+    channel: stereo
+
+speaker:
+  - platform: i2s_audio
+    id: i2s_speaker
+    sample_rate: 48000
+    i2s_mode: secondary
+    i2s_dout_pin: GPIO10
+    bits_per_sample: 32bit
+    i2s_audio_id: i2s_output
+    dac_type: external
+    channel: stereo
+    timeout: never
+    buffer_duration: 500ms
+    audio_dac: voice_dac
+  - platform: mixer
+    id: mixing_speaker
+    output_speaker: i2s_speaker
+    num_channels: 2
+    task_stack_in_psram: true
+    source_speakers:
+      - id: voice_mix
+        timeout: never
+      - id: sound_mix
+        timeout: never
+  - platform: resampler
+    id: voice_speaker
+    output_speaker: voice_mix
+    sample_rate: 48000
+    bits_per_sample: 16
+  - platform: resampler
+    id: sound_speaker
+    output_speaker: sound_mix
+    sample_rate: 48000
+    bits_per_sample: 16
+
+audio_dac:
+  - platform: aic3204
+    id: voice_dac
+    i2c_id: internal_i2c
+
+audio_file:
+  - id: mute_on_sound
+    file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/mute_switch_on.flac
+  - id: mute_off_sound
+    file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/mute_switch_off.flac
+  - id: wake_pling
+    file: ./LiveVoiceFirmware/boards/sounds/wake_pling.wav
+
+media_source:
+  - platform: audio_file
+    id: sound_files
+
+media_player:
+  - platform: speaker_source
+    id: sound_player
+    name: Sounds
+    internal: true
+    announcement_pipeline:
+      format: FLAC
+      num_channels: 1
+      sample_rate: 48000
+      speaker: sound_speaker
+      sources:
+        - sound_files
+
+voice_kit:
+  id: voice_kit_component
+  i2c_id: internal_i2c
+  reset_pin: GPIO4
+  firmware:
+    url: https://github.com/esphome/voice-kit-xmos-firmware/releases/download/v1.3.1/ffva_v1.3.1_upgrade.bin
+    version: "1.3.1"
+    md5: 964635c5bf125529dab14a2472a15401
+
+external_components:
+  - source:
+      type: local
+      path: ./LiveVoiceFirmware/esphome/components
+    components: [live_voice, aic3204]
+  - source:
+      type: git
+      url: https://github.com/esphome/home-assistant-voice-pe
+      ref: 5a4e7eec11cc6df75386de10b8f961a00dd8a82e
+    components: [voice_kit]
+
+live_voice:
+  id: voice
+  url: ${va_url}
+  device: voice_pe
+  microphone: board_mics
+  mic_channel: 0
+  speaker: voice_speaker
+  input_rate: 16000
+  output_rate: 24000
+  aec_verified: false
+
+micro_wake_word:
+  id: wake
+  microphone:
+    microphone: board_mics
+    channels: 1
+  stop_after_detection: false
+  models:
+    - model: alexa
+      id: alexa_model
+    - model: okay_nabu
+      id: okay_nabu_model
+  vad:
+    model: https://raw.githubusercontent.com/SandorDrift23/home-assistant-voice-pe/feature/gpt-live-voice-pe/wake-models/vad.json
+  on_wake_word_detected:
+    - if:
+        condition:
+          binary_sensor.is_off: mute_switch
+        then:
+          - script.execute: begin_conversation
+
+power_supply:
+  - id: led_power
+    pin: GPIO45
+
+light:
+  - platform: esp32_rmt_led_strip
+    id: led_ring
+    name: LED ring
+    pin: GPIO21
+    chipset: WS2812
+    num_leds: 12
+    channel_colors: GRB
+    rmt_symbols: 192
+    default_transition_length: 0ms
+    power_supply: led_power
+
+script:
+  - id: play_sound
+    parameters:
+      sound_file: string
+    then:
+      - media_player.play_media:
+          id: sound_player
+          announcement: true
+          media_url: !lambda 'return std::string("audio-file://") + sound_file;'
+  - id: begin_conversation
+    mode: single
+    then:
+      - script.execute:
+          id: play_sound
+          sound_file: wake_pling
+      - wait_until:
+          condition:
+            media_player.is_announcing:
+              id: sound_player
+          timeout: 400ms
+      - wait_until:
+          condition:
+            not:
+              media_player.is_announcing:
+                id: sound_player
+          timeout: 2s
+      - delay: 150ms
+      - lambda: 'id(voice).start_session();'
+  - id: apply_wake_word
+    then:
+      - lambda: |-
+          id(alexa_model).disable();
+          id(okay_nabu_model).disable();
+          if (id(wake_word_choice).current_option() == "Okay Nabu") {
+            id(okay_nabu_model).enable();
+          } else {
+            id(alexa_model).enable();
+          }
+  # The dial shows 10-100%. That range drives the codec from 0.50 to 0.90,
+  # the quietest and loudest settings that were tuned by ear on the device.
+  - id: apply_volume
+    then:
+      - lambda: |-
+          float level = id(volume_level);
+          if (level < 0.10f)
+            level = 0.10f;
+          else if (level > 1.00f)
+            level = 1.00f;
+          id(volume_level) = level;
+          float dac = 0.50f + (level - 0.10f) / 0.90f * 0.40f;
+          id(voice_dac).set_volume(dac);
+          float percent = level * 100.0f;
+          id(volume_percent).publish_state(percent);
+          ESP_LOGI("live_voice", "Output %s, dial %.0f%%, codec %.2f",
+                   id(jack_plugged).state ? "line" : "speaker", percent, dac);
+  - id: show_status
+    mode: restart
+    then:
+      - lambda: |-
+          int mode = 0;
+          if (!id(voice).is_connected()) {
+            mode = 1;
+          } else if (id(mute_switch).state) {
+            mode = 2;
+          } else if (id(voice).is_streaming()) {
+            mode = 3;
+          }
+          if (mode == 3) {
+            id(led_mode) = 3;
+            int step = id(led_pulse);
+            id(led_pulse) = (step + 1) % 50;
+            float rise = 0.5f - 0.5f * cosf(step * 6.2831853f / 50.0f);
+            float brightness = 0.50f + rise * 0.50f;
+            id(led_ring).turn_on().set_rgb(0.55f, 1.0f, 0.30f).set_brightness(brightness).perform();
+            return;
+          }
+          id(led_pulse) = 0;
+          if (mode == id(led_mode)) {
+            return;
+          }
+          id(led_mode) = mode;
+          if (mode == 1) {
+            id(led_ring).turn_on().set_rgb(1.0f, 0.0f, 0.0f).set_brightness(0.4f).perform();
+          } else if (mode == 2) {
+            id(led_ring).turn_on().set_rgb(1.0f, 0.35f, 0.0f).set_brightness(0.4f).perform();
+          } else {
+            id(led_ring).turn_off().perform();
+          }
+
+globals:
+  - id: led_mode
+    type: int
+    restore_value: no
+    initial_value: "-1"
+  - id: led_pulse
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: volume_level
+    type: float
+    restore_value: yes
+    initial_value: "0.60"
+
+interval:
+  - interval: 50ms
+    then:
+      - script.execute: show_status
+
+select:
+  - platform: template
+    name: Wake word
+    id: wake_word_choice
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_option: Alexa
+    options:
+      - Alexa
+      - Okay Nabu
+    set_action:
+      - script.execute: apply_wake_word
+
+sensor:
+  - platform: rotary_encoder
+    id: volume_dial
+    internal: true
+    pin_a: GPIO16
+    pin_b: GPIO18
+    resolution: 2
+    on_clockwise:
+      - lambda: 'id(volume_level) += 0.05f;'
+      - script.execute: apply_volume
+    on_anticlockwise:
+      - lambda: 'id(volume_level) -= 0.05f;'
+      - script.execute: apply_volume
+  - platform: template
+    name: Volume
+    id: volume_percent
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    lambda: |-
+      return id(volume_level) * 100.0f;
+    update_interval: 60s
+
+binary_sensor:
+  - platform: gpio
+    id: mute_switch
+    name: Mute
+    pin: GPIO3
+    on_press:
+      - if:
+          condition:
+            lambda: 'return id(voice).is_streaming();'
+          then:
+            - lambda: 'id(voice).send_interrupt();'
+      - script.execute:
+          id: play_sound
+          sound_file: mute_on_sound
+    on_release:
+      - script.execute:
+          id: play_sound
+          sound_file: mute_off_sound
+  - platform: gpio
+    id: jack_plugged
+    name: Audio jack
+    pin: GPIO17
+    filters:
+      - delayed_on: 200ms
+      - delayed_off: 200ms
+    on_press:
+      - script.execute: apply_volume
+    on_release:
+      - script.execute: apply_volume
+  - platform: gpio
+    id: center_button
+    pin:
+      number: GPIO0
+      inverted: true
+    on_click:
+      - if:
+          condition:
+            binary_sensor.is_on: mute_switch
+          then:
+            - logger.log: "Center button ignored while muted"
+          else:
+            - lambda: |-
+                if (id(voice).is_streaming()) {
+                  id(voice).end_session();
+                } else {
+                  id(begin_conversation).execute();
+                }
