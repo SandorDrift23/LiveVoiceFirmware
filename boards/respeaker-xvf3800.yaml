@@ -1,34 +1,61 @@
-# ReSpeaker XVF3800 + XIAO ESP32-S3 target.
-# Same full-duplex client and protocol as Voice PE. The XVF inthost firmware,
-# AEC register setup, and AIC3104 codec driver are not in this image yet, so
-# aec_verified stays false and speaker output is not brought up.
+# ReSpeaker XVF3800 + XIAO ESP32-S3.
+# The XVF3800 is the 48 kHz I2S clock master. Capture is decimated to 16 kHz
+# because the DSP output has no content above 8 kHz, and live_voice's
+# microphone buffer is sized for 16 kHz. Playback stays at 48 kHz.
+#
+# XMOS firmware 1.0.9 is stored in the ESP image and written over I2C when the
+# chip reports a different version. That only works once an I2S image is
+# already running. The factory USB firmware has no I2C DFU, so a new board
+# needs one USB flash of respeaker_xvf3800_i2s_master_v1.0.9_48k.bin on the
+# XMOS USB-C port (next to the 3.5 mm jack) before the first ESPHome boot:
+#   dfu-util -R -e -a 1 -D respeaker_xvf3800_i2s_master_v1.0.9_48k.bin
+# Hold Mute while connecting power if the chip does not enumerate. The red
+# LED blinks in that safe mode. Do not flash the USB 2.x images.
+#
+# The 12-LED ring is on the XVF, not a GPIO. Status matches Voice PE: red
+# while the gateway is down, orange while muted, a pulse during a
+# conversation, and off while idle.
+#
+# Not yet tested on ReSpeaker hardware. AEC is the firmware default and is
+# still reported as unverified.
 substitutions:
   name: live-voice-respeaker
   friendly_name: Live Voice ReSpeaker
-  va_url: "ws://192.168.1.10:8080/"
+  va_url: "ws://homeassistant.local:8080/" 
   hidden_ssid: "false"
+  xvf_ref: "2026.11.0"
+  decimator_ref: "2026.10.4"
 
 esphome:
   name: ${name}
   friendly_name: ${friendly_name}
   name_add_mac_suffix: false
-  min_version: 2026.5.0
+  min_version: 2026.10.0
   project:
     name: livevoice.respeaker-xvf3800
-    version: "0.1.0"
+    version: "0.2.1"
   on_boot:
     priority: 200
     then:
-      - delay: 8s
+      # Speaker start unmutes the AIC3104 while its volume is still 0, which
+      # writes full attenuation. Set a moderate level after the DSP is up.
+      - delay: 2s
+      - lambda: "id(voice_dac).set_volume(0.60f);"
       - micro_wake_word.start:
 
 esp32:
   board: esp32-s3-devkitc-1
+  cpu_frequency: 240MHz
   variant: esp32s3
   flash_size: 8MB
   framework:
     type: esp-idf
     version: recommended
+    sdkconfig_options:
+      CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
+      CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
+      CONFIG_SPIRAM_RODATA: "y"
+      CONFIG_SPIRAM_FETCH_INSTRUCTIONS: "y"
 
 psram:
   mode: octal
@@ -51,23 +78,34 @@ ota:
   - platform: esphome
     password: ${ota_password}
 
-# XVF3800 is the I2S clock master. Two slave controllers share its clocks;
-# one duplex controller corrupted DMA on this hardware.
+i2c:
+  - id: internal_i2c
+    sda: GPIO5
+    scl: GPIO6
+    frequency: 400kHz
+    scan: true
+
+# Two secondary controllers share the XVF clocks. One duplex controller
+# corrupted DMA on this hardware.
 i2s_audio:
   - id: i2s_output
     i2s_lrclk_pin:
       number: GPIO7
+      allow_other_uses: true
     i2s_bclk_pin:
       number: GPIO8
+      allow_other_uses: true
   - id: i2s_input
     i2s_lrclk_pin:
       number: GPIO7
+      allow_other_uses: true
     i2s_bclk_pin:
       number: GPIO8
+      allow_other_uses: true
 
 microphone:
   - platform: i2s_audio
-    id: board_mics
+    id: i2s_mics_raw
     i2s_din_pin: GPIO43
     adc_type: external
     pdm: false
@@ -76,6 +114,13 @@ microphone:
     i2s_mode: secondary
     i2s_audio_id: i2s_input
     channel: stereo
+  # Keeps 1 of 3 frames and does not filter. The stock resampler rolls off
+  # the speech band that the DSP already limited to 8 kHz.
+  - platform: decimator
+    id: board_mics
+    microphone:
+      microphone: i2s_mics_raw
+      channels: [0, 1]
 
 speaker:
   - platform: i2s_audio
@@ -89,10 +134,11 @@ speaker:
     channel: stereo
     timeout: never
     buffer_duration: 500ms
+    audio_dac: voice_dac
   - platform: mixer
     id: mixing_speaker
     output_speaker: i2s_speaker
-    num_channels: 1
+    num_channels: 2
     task_stack_in_psram: true
     source_speakers:
       - id: voice_mix
@@ -105,12 +151,65 @@ speaker:
     sample_rate: 48000
     bits_per_sample: 16
 
+audio_dac:
+  - platform: aic3104
+    id: voice_dac
+    i2c_id: internal_i2c
+
+respeaker_xvf3800:
+  id: respeaker
+  address: 0x2C
+  i2c_id: internal_i2c
+  mute_switch:
+    id: mic_mute
+    name: Microphone mute
+    update_interval: 1s
+    on_turn_on:
+      - if:
+          condition:
+            lambda: "return id(voice).is_streaming();"
+          then:
+            - lambda: "id(voice).send_interrupt();"
+  dfu_version:
+    name: XVF3800 firmware
+    update_interval: 120s
+  # The DSP mutes on a press by itself. This only stops playback immediately
+  # instead of waiting for the mute-switch poll.
+  mute_button:
+    id: mute_button
+    internal: true
+    update_interval: 50ms
+    on_press:
+      - if:
+          condition:
+            lambda: "return id(voice).is_streaming();"
+          then:
+            - lambda: "id(voice).send_interrupt();"
+  firmware:
+    url: https://github.com/formatBCE/Respeaker-XVF3800-ESPHome-integration/raw/${xvf_ref}/respeaker_xvf3800_i2s_master_v1.0.9_48k.bin
+    version: "1.0.9"
+    md5: b62766ccf8fbbaf924d0d13beace495b
+    on_error:
+      - logger.log: "XVF3800 firmware update failed"
+
 external_components:
   - source:
       type: local
-      path: components
+      path: ./LiveVoiceFirmware/esphome/components
     components: [live_voice]
+  - source:
+      type: git
+      url: https://github.com/formatBCE/Respeaker-XVF3800-ESPHome-integration
+      ref: ${xvf_ref}
+    components: [respeaker_xvf3800, aic3104]
+  - source:
+      type: git
+      url: https://github.com/formatBCE/Respeaker-Lite-ESPHome-integration
+      ref: ${decimator_ref}
+    components: [decimator]
 
+# Channel 0 is the AEC comms output. The component writes that route on boot.
+# Channel 1 is the ASR beam and is not used here.
 live_voice:
   id: voice
   url: ${va_url}
@@ -118,7 +217,7 @@ live_voice:
   microphone: board_mics
   mic_channel: 0
   speaker: voice_speaker
-  input_rate: 48000
+  input_rate: 16000
   output_rate: 24000
   aec_verified: false
 
@@ -138,11 +237,75 @@ micro_wake_word:
   on_wake_word_detected:
     - if:
         condition:
-          lambda: 'return wake_word == "Stop" || wake_word == "stop";'
+          switch.is_on: mic_mute
         then:
-          - lambda: 'id(voice).send_interrupt();'
+          - logger.log: "Wake word ignored while muted"
         else:
-          - lambda: 'id(voice).start_session();'
+          - if:
+              condition:
+                lambda: 'return wake_word == "Stop" || wake_word == "stop";'
+              then:
+                - lambda: "id(voice).send_interrupt();"
+              else:
+                - lambda: "id(voice).start_session();"
+
+script:
+  - id: show_status
+    mode: restart
+    then:
+      - lambda: |-
+          int mode = 0;
+          if (!id(voice).is_connected()) {
+            mode = 1;
+          } else if (id(mic_mute).state) {
+            mode = 2;
+          } else if (id(voice).is_streaming()) {
+            mode = 3;
+          }
+          uint32_t colors[12];
+          if (mode == 3) {
+            id(led_mode) = 3;
+            int step = id(led_pulse);
+            id(led_pulse) = (step + 1) % 50;
+            float rise = 0.5f - 0.5f * cosf(step * 6.2831853f / 50.0f);
+            float brightness = 0.50f + rise * 0.50f;
+            uint8_t r = (uint8_t) (0.55f * 255.0f * brightness);
+            uint8_t g = (uint8_t) (255.0f * brightness);
+            uint8_t b = (uint8_t) (0.30f * 255.0f * brightness);
+            uint32_t color = (uint32_t(r) << 16) | (uint32_t(g) << 8) | b;
+            for (int i = 0; i < 12; i++) colors[i] = color;
+            id(respeaker).set_led_ring(colors);
+            return;
+          }
+          id(led_pulse) = 0;
+          if (mode == id(led_mode))
+            return;
+          id(led_mode) = mode;
+          uint32_t color = 0;
+          if (mode == 1) {
+            color = (uint32_t) (0.4f * 255.0f) << 16;
+          } else if (mode == 2) {
+            uint8_t r = (uint8_t) (0.4f * 255.0f);
+            uint8_t g = (uint8_t) (0.35f * 0.4f * 255.0f);
+            color = (uint32_t(r) << 16) | (uint32_t(g) << 8);
+          }
+          for (int i = 0; i < 12; i++) colors[i] = color;
+          id(respeaker).set_led_ring(colors);
+
+globals:
+  - id: led_mode
+    type: int
+    restore_value: no
+    initial_value: "-1"
+  - id: led_pulse
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+interval:
+  - interval: 50ms
+    then:
+      - script.execute: show_status
 
 binary_sensor:
   - platform: gpio
@@ -150,9 +313,15 @@ binary_sensor:
       number: GPIO0
       inverted: true
     on_click:
-      - lambda: |-
-          if (id(voice).is_streaming()) {
-            id(voice).send_interrupt();
-          } else {
-            id(voice).start_session();
-          }
+      - if:
+          condition:
+            switch.is_on: mic_mute
+          then:
+            - logger.log: "Button ignored while muted"
+          else:
+            - lambda: |-
+                if (id(voice).is_streaming()) {
+                  id(voice).send_interrupt();
+                } else {
+                  id(voice).start_session();
+                }

@@ -19,8 +19,9 @@ ReSpeaker configurations.
 ## Hardware status
 
 - **Home Assistant Voice PE:** current development and tested target.
-- **ReSpeaker XVF3800:** not built and not tested on ReSpeaker hardware. Its
-  configuration is an experimental starting point, not a ready-to-flash image.
+- **ReSpeaker XVF3800:** configuration includes the XMOS I2S firmware update,
+  codec, and 16 kHz capture path. It has not been compiled or tested on
+  ReSpeaker hardware.
 
 ## Home Assistant Voice PE
 
@@ -59,15 +60,25 @@ resources are referenced by URL and are not maintained in this repository.
 
 ## ReSpeaker XVF3800
 
-`boards/respeaker-xvf3800.yaml` describes a proposed Seeed XVF3800 path with
-the XVF3800 as 48 kHz I²S master, microphone data on GPIO43, and speaker data
-on GPIO44. The gateway can resample its declared 48 kHz capture rate to the
-24 kHz GPT-Live rate.
+`boards/respeaker-xvf3800.yaml` uses the XVF3800 as 48 kHz I²S master.
+Microphone data is on GPIO43 and speaker data is on GPIO44. The DSP output is
+band-limited to 8 kHz, so a decimator keeps one frame in three and the gateway
+receives 16 kHz. Playback is 24 kHz from the gateway, resampled to 48 kHz.
+The image embeds Seeed I2S master firmware **1.0.9** and writes it over I²C
+when the chip version differs. The AIC3104 digital volume is set on boot. AEC
+stays the firmware default and is reported as unverified.
 
-This configuration has **not been built and has not been tested on a
-ReSpeaker**. It does not yet load the XVF `inthost` firmware, configure acoustic
-echo cancellation, or drive the AIC3104 codec. ESPHome may also reject the
-shared clock pins used by the separate receive and transmit controllers.
+A factory board still running the USB firmware cannot take that I²C update.
+Flash `respeaker_xvf3800_i2s_master_v1.0.9_48k.bin` once with `dfu-util` on the
+XMOS USB-C port, then flash this ESPHome image on the XIAO port. Later 1.0.9
+updates happen at boot. Do not flash the USB 2.x images; they have no I²S
+output and no I²C update path.
+
+The ring follows the Voice PE status colours: red while the gateway is down,
+orange while muted, a pulse during a conversation, and off while idle.
+
+This configuration has **not been compiled and has not been tested on a
+ReSpeaker**.
 
 ## Protocol
 
@@ -87,6 +98,8 @@ This project builds on ESPHome and references:
 - [ESPHome](https://github.com/esphome/esphome)
 - [Home Assistant Voice PE](https://github.com/esphome/home-assistant-voice-pe)
 - [Voice Kit XMOS firmware](https://github.com/esphome/voice-kit-xmos-firmware)
+- [reSpeaker XVF3800 firmware](https://github.com/respeaker/reSpeaker_XVF3800_USB_4MIC_ARRAY)
+- [reSpeaker XVF3800 ESPHome integration](https://github.com/formatBCE/Respeaker-XVF3800-ESPHome-integration)
 
 The local `aic3204` component originated in ESPHome and contains a small
 compatibility adjustment for component discovery. ESPHome's Python and
